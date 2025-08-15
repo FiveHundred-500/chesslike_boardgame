@@ -68,9 +68,14 @@
         if (typeof cfg.workers !== 'number') cfg.workers = optimalWorkers(cores);
         if (typeof cfg.showVectors !== 'boolean') cfg.showVectors = true;
         if (typeof cfg.showPieces !== 'boolean') cfg.showPieces = true;
+        if (typeof cfg.preventOverrun !== 'boolean') cfg.preventOverrun = true;
         if (typeof cfg.thinkOnce !== 'boolean') cfg.thinkOnce = false;
         if (typeof cfg.autoDetect !== 'boolean') cfg.autoDetect = false;
         if (typeof cfg.halt !== 'boolean') cfg.halt = false;
+        // Experimental: root early-abort toggle (separate from overrun prevention)
+        if (typeof cfg.rootEarlyAbort !== 'boolean') cfg.rootEarlyAbort = false;
+        // Overrun budget (seconds) when preventOverrun is OFF
+        if (typeof cfg.overrunBudget !== 'number' || !isFinite(cfg.overrunBudget) || cfg.overrunBudget < 0) cfg.overrunBudget = 0.6;
         if (cfg.myColor !== 'w' && cfg.myColor !== 'b') cfg.myColor = 'w';
         if (typeof cfg.collapsed !== 'boolean') cfg.collapsed = true;
         window.injected_overlayCfg = cfg;
@@ -82,33 +87,38 @@
         if(!el){
           el=document.createElement('div');
           el.id=id;
-          el.innerHTML = ''+
-            '<div style="display:flex;align-items:center;gap:8px;">'
-          +   '<button id="cfg-toggle" title="펼치기/접기" style="background:transparent;border:none;color:#fff;cursor:pointer;font-size:14px;line-height:1;padding:2px 4px;">▸</button>'
-          +   '<b style="flex:1 1 auto;">AI Settings</b>'
-          +   '<div style="margin-left:auto;display:flex;gap:6px;align-items:center;">'
+          el.innerHTML = ''
+          +'<div style="display:flex;align-items:center;gap:8px;">'
+          +  '<button id="cfg-toggle" title="펼치기/접기" style="background:transparent;border:none;color:#fff;cursor:pointer;font-size:14px;line-height:1;padding:2px 4px;">▸</button>'
+          +  '<b style="flex:1 1 auto;">AI Settings</b>'
+          +  '<div style="margin-left:auto;display:flex;gap:6px;align-items:center;">'
           +     '<button id="cfg-halt" style="background:#F44336;color:#fff;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;">Halt</button>'
           +     '<button id="cfg-think-now" style="background:#2196F3;color:#fff;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;">Run AI</button>'
-          +   '</div>'
+          +  '</div>'
           + '</div>'
-          + '<div id="cfg-body" style="margin-top:6px;">'
-          +   '<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;align-items:center;">'
-          +     '<label>Time (s)</label>'
-          +     '<input id="cfg-time" type="number" min="0.2" step="0.1" style="width:100%;padding:2px 4px;">'
-          +     '<label>Mode</label>'
-          +     '<div>'
-          +       '<label style="margin-right:6px;"><input type="radio" name="cfg-mode" value="seq"> SEQ</label>'
-          +       '<label><input type="radio" name="cfg-mode" value="mp"> MP</label>'
-          +     '</div>'
-          +     '<label id="cfg-workers-label">Workers</label>'
-          +     '<input id="cfg-workers" type="number" min="1" max="64" step="1" style="width:100%;padding:2px 4px;">'
-          +     '<label>Options</label>'
-          +     '<div>'
-          +       '<label style="margin-right:8px;"><input id="cfg-vectors" type="checkbox" checked> Vectors</label>'
-          +       '<label><input id="cfg-pieces" type="checkbox"> Pieces</label>'
-          +     '</div>'
-          +   '</div>'
-          + '</div>';
+          +'<div id="cfg-body" style="margin-top:6px;">'
+          +  '<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;align-items:center;">'
+          +    '<label>Time (s)</label>'
+          +    '<input id="cfg-time" type="number" min="0.2" step="0.1" style="width:100%;padding:2px 4px;">'
+          +    '<label>Mode</label>'
+          +    '<div>'
+          +      '<label style="margin-right:6px;"><input type="radio" name="cfg-mode" value="seq"> SEQ</label>'
+          +      '<label><input type="radio" name="cfg-mode" value="mp"> MP</label>'
+          +    '</div>'
+          +    '<label id="cfg-workers-label">Workers</label>'
+          +    '<input id="cfg-workers" type="number" min="1" max="64" step="1" style="width:100%;padding:2px 4px;">'
+          +    '<label>Options</label>'
+          +    '<div style="display:flex; flex-wrap:wrap; align-items:center; column-gap:8px; row-gap:4px;">'
+          +      '<label style="margin-right:8px;"><input id="cfg-vectors" type="checkbox" checked> Vectors</label>'
+          +      '<label style="margin-right:8px;"><input id="cfg-pieces" type="checkbox"> Pieces</label>'
+          +      '<label style="margin-right:8px;"><input id="cfg-overrun" type="checkbox" checked> overrun block</label>'
+          +      '<label style="margin-right:8px;"><input id="cfg-root-early" type="checkbox"> root-early block</label>'
+          +    '</div>'
+          +    '<label>Overrun Budget (s)</label>'
+          +    '<input id="cfg-overrun-budget" type="number" min="0" step="0.1" style="width:100%;padding:2px 4px;">'
+          +    '</div>'
+          +  '</div>'
+          +'</div>';
           // Insert settings panel below the badge bar if it exists, otherwise at top
           var __bar = document.getElementById('injected_overlay-badges');
           if(__bar && __bar.parentNode === root){
@@ -126,6 +136,9 @@
             var workersLabel=document.getElementById('cfg-workers-label');
             var vectors=document.getElementById('cfg-vectors');
             var pieces=document.getElementById('cfg-pieces');
+            var overrun=document.getElementById('cfg-overrun');
+            var overrunBudget=document.getElementById('cfg-overrun-budget');
+            var rootEarly=document.getElementById('cfg-root-early');
             var seq=document.querySelector('input[name="cfg-mode"][value="seq"]');
             var mp=document.querySelector('input[name="cfg-mode"][value="mp"]');
             if (time) {
@@ -136,6 +149,9 @@
             if (workers) workers.value = String(c.workers);
             if (vectors) vectors.checked = !!c.showVectors;
             if (pieces) pieces.checked = !!c.showPieces;
+            if (overrun) overrun.checked = !!c.preventOverrun;
+            if (overrunBudget) overrunBudget.value = String((typeof c.overrunBudget==='number' && isFinite(c.overrunBudget) ? c.overrunBudget : 0.6).toFixed ? c.overrunBudget.toFixed(1) : c.overrunBudget);
+            if (rootEarly) rootEarly.checked = !!c.rootEarlyAbort;
             if (seq) seq.checked = (c.mode === 'seq');
             if (mp) mp.checked = (c.mode === 'mp');
             var showW = (c.mode === 'mp');
@@ -155,6 +171,9 @@
             var workers=document.getElementById('cfg-workers');
             var vectors=document.getElementById('cfg-vectors');
             var pieces=document.getElementById('cfg-pieces');
+            var overrun=document.getElementById('cfg-overrun');
+            var overrunBudget=document.getElementById('cfg-overrun-budget');
+            var rootEarly=document.getElementById('cfg-root-early');
             var seq=document.querySelector('input[name="cfg-mode"][value="seq"]');
             var mp=document.querySelector('input[name="cfg-mode"][value="mp"]');
             var run=document.getElementById('cfg-think-now');
@@ -169,6 +188,9 @@
             if (run) run.addEventListener('click', function(){ window.injected_overlayCfgSet({ thinkOnce: true, autoDetect: true }); applyToUi(); try{ if(window.injected_overlayUpdateAutoBadge) window.injected_overlayUpdateAutoBadge(); }catch(e){} });
             if (halt) halt.addEventListener('click', function(){ try{ window.injected_overlayCfgSet({ halt: true, autoDetect: false, thinkOnce: false }); if(window.injected_overlayUpdateAutoBadge) window.injected_overlayUpdateAutoBadge(); }catch(e){} });
             if (toggle) toggle.addEventListener('click', function(){ try{ window.injected_overlayCfgSet({ collapsed: !window.injected_overlayCfg.collapsed }); }catch(e){} applyToUi(); });
+            if (overrun) overrun.addEventListener('change', function(){ var on = !!overrun.checked; window.injected_overlayCfgSet({ preventOverrun: on }); });
+            if (overrunBudget) overrunBudget.addEventListener('change', function(){ var v = clamp(overrunBudget.value, 0, 30); window.injected_overlayCfgSet({ overrunBudget: Number(v) }); applyToUi(); });
+            if (rootEarly) rootEarly.addEventListener('change', function(){ var on = !!rootEarly.checked; window.injected_overlayCfgSet({ rootEarlyAbort: on }); });
           }catch(e){}
           applyToUi();
         },0);
@@ -182,6 +204,49 @@
   // Keep overlay clickability and stacking
       window.injected_overlayClickabilityKeepAlive = window.injected_overlayClickabilityKeepAlive || (function(){
         var tid = null;
+    function constrainOverlayWidthToAvoidBoard(){
+          try{
+            var root = document.getElementById('injected_overlay-root');
+            if(!root) return;
+            // Anchor top-right consistently
+            var margin = 12;
+            root.style.position = 'fixed';
+            root.style.top = margin + 'px';
+            root.style.right = margin + 'px';
+            root.style.left = '';
+
+            var board = document.querySelector('wc-chess-board');
+            var boardRect = board ? board.getBoundingClientRect() : null;
+            var vw = window.innerWidth || document.documentElement.clientWidth || 1280;
+            // If board is not detected, release fixed max width so overlay can size naturally
+            if (!boardRect) {
+              // Clear forced widths
+              root.style.maxWidth = '';
+              root.style.width = '';
+              var cfg0 = document.getElementById('injected_overlay-config');
+              var log0 = document.getElementById('injected_overlay-log');
+              if (cfg0){ cfg0.style.maxWidth=''; cfg0.style.width=''; }
+              if (log0){ log0.style.maxWidth=''; log0.style.width=''; }
+              return;
+            }
+            // Available gap between board's right edge and viewport right (minus margins)
+            var gapRight = (vw - margin - boardRect.right);
+      var allowed = Math.max(0, Math.floor(gapRight - margin));
+      // Final fixed width: never exceed allowed; don't let content change it.
+      // Keep a tiny minimum but prefer not to overlap board if very small.
+      var fixedPx = allowed; // strictly cap to avoid crossing into board
+
+            // Override min/max widths so we can shrink without overlapping the board
+            var cfg = document.getElementById('injected_overlay-config');
+            var log = document.getElementById('injected_overlay-log');
+      var px = (fixedPx > 0 ? fixedPx : 0);
+      // Apply strict width so content doesn't affect it
+      root.style.maxWidth = px ? (px + 'px') : '';
+      root.style.width = px ? (px + 'px') : '';
+      if (cfg){ cfg.style.minWidth = '0px'; cfg.style.maxWidth = px ? (px + 'px') : ''; cfg.style.width = px ? (px + 'px') : ''; }
+      if (log){ log.style.minWidth = '0px'; log.style.maxWidth = px ? (px + 'px') : ''; log.style.width = px ? (px + 'px') : ''; }
+          }catch(e){}
+        }
         function tick(){
           try{
             var r = document.getElementById('injected_overlay-root');
@@ -202,9 +267,14 @@
             if (colorBadge){ colorBadge.style.pointerEvents='auto'; colorBadge.style.zIndex='5'; }
             var legend = document.getElementById('injected_overlay-vector-legend');
             if (legend){ legend.style.pointerEvents='none'; legend.style.zIndex='1'; }
+            constrainOverlayWidthToAvoidBoard();
           }catch(e){}
         }
-        if (!tid){ tick(); tid = window.setInterval(tick, 500); }
+        if (!tid){
+          tick();
+          tid = window.setInterval(tick, 500);
+          try{ window.addEventListener('resize', tick, { passive: true }); }catch(e){}
+        }
         return function(){ tick(); };
       })();
 

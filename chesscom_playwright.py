@@ -6,6 +6,7 @@ from pathlib import Path
 import threading
 import queue
 from typing import List, Optional, Tuple
+import multiprocessing as mp
 
 from alphabeta import fen_to_board, GameState, rc_to_algebraic, iterative_deepening_search
 from simple_multiprocess import get_multiprocess_move
@@ -249,6 +250,14 @@ def _overlay_set(page, html: str, append: bool = False) -> None:
         {"h": html, "a": append},
     )
 
+def _overlay_append_halted_once(page) -> None:
+    try:
+        page.evaluate(
+            "()=>{ try{ if(!window.__aiHaltStamped){ window.__aiHaltStamped=true; if(window.injected_overlayOverlaySet){ window.injected_overlayOverlaySet(\"<div><b>AI</b> <span style='opacity:.85'>halted</span></div>\", true); } } }catch(e){} }"
+        )
+    except Exception:
+        pass
+
 
 def _ensure_config_ui(page, default_time: float = THINK_TIME) -> None:
     # Assets should already be present via context init scripts; just install UI
@@ -289,16 +298,13 @@ def _force_halt_reset(page) -> None:
         _vector_clear(page)
     except Exception:
         pass
-    try:
-        _overlay_set(page, "<div><b>AI</b> <span style='opacity:.85'>halted</span></div>")
-    except Exception:
-        pass
+    _overlay_append_halted_once(page)
 
 def _overlay_clear_halt_keep_cfg(page) -> None:
     """Turn off halt without changing other config flags, update badges if available."""
     try:
         page.evaluate(
-            "()=>{ if(window.injected_overlayCfgSet){ window.injected_overlayCfgSet({ halt: false }); if(window.injected_overlayUpdateAutoBadge) window.injected_overlayUpdateAutoBadge(); } }"
+            "()=>{ if(window.injected_overlayCfgSet){ window.injected_overlayCfgSet({ halt: false }); if(window.injected_overlayUpdateAutoBadge) window.injected_overlayUpdateAutoBadge(); } window.__aiHaltStamped=false; }"
         )
     except Exception:
         pass
@@ -353,15 +359,19 @@ def _pl_click_move_simple(page, from_sq: str, to_sq: str) -> None:
     except Exception:
         pass
     if flipped:
-        tx = bx + ((8 - tf + 0.5) * (bw / 8))
-        ty = by + ((tr - 1 + 0.5) * (bh / 8))
+        lx = ((8 - tf + 0.5) * (bw / 8))
+        ly = ((tr - 1 + 0.5) * (bh / 8))
     else:
-        tx = bx + ((tf - 1 + 0.5) * (bw / 8))
-        ty = by + ((8 - tr + 0.5) * (bh / 8))
+        lx = ((tf - 1 + 0.5) * (bw / 8))
+        ly = ((8 - tr + 0.5) * (bh / 8))
+    # Click relative to the board element for better targeting; fallback to page mouse
     try:
-        page.mouse.click(tx, ty)
+        board.click(position={"x": lx, "y": ly}, force=True, timeout=800)
     except Exception:
-        pass
+        try:
+            page.mouse.click(bx + lx, by + ly)
+        except Exception:
+            pass
 
 def _pl_click_move(page, from_sq: str, to_sq: str, my_color: str, timeout_ms: int = 6000) -> None:
     """Click a move by selecting a piece and then clicking the destination square directly.
@@ -371,7 +381,10 @@ def _pl_click_move(page, from_sq: str, to_sq: str, my_color: str, timeout_ms: in
     to_xy = _sq_to_xy(to_sq)
 
     board = page.locator('wc-chess-board')
-
+    # Track state across attempts; break early on success
+    last_exc = None
+    clicked_piece = False
+    highlighted = False
     for attempt in range(3):
         if _overlay_is_halt(page):
             _force_halt_reset(page)
@@ -381,8 +394,6 @@ def _pl_click_move(page, from_sq: str, to_sq: str, my_color: str, timeout_ms: in
             board.locator(f'.piece.square-{from_xy}').first,
             board.locator(f'.square-{from_xy}').first
         ]
-        last_exc = None
-        clicked_piece = False
         for pl in piece_locators:
             try:
                 pl.wait_for(state='attached', timeout=500)
@@ -396,12 +407,15 @@ def _pl_click_move(page, from_sq: str, to_sq: str, my_color: str, timeout_ms: in
 
         # 2) Wait for the piece to be selected (highlight element added)
         hl = board.locator(f'.highlight.square-{from_xy}')
-        highlighted = False
         try:
             hl.wait_for(state='attached', timeout=500)
             highlighted = True
         except Exception:
             time.sleep(0.1)
+
+        # If both succeeded, stop retrying
+        if clicked_piece and highlighted:
+            break
 
     if not clicked_piece:
         raise last_exc or Exception(f"Piece .square-{from_xy} not clickable")
@@ -435,12 +449,19 @@ def _pl_click_move(page, from_sq: str, to_sq: str, my_color: str, timeout_ms: in
     except Exception:
         raise Exception(f"Invalid to_xy: {to_xy}")
     if _board_flipped(page.content()):
-        to_x = board_x + ((8 - to_file + 0.5) * (board_w / 8))
-        to_y = board_y + ((to_rank - 1 + 0.5) * (board_h / 8))
+        local_x = ((8 - to_file + 0.5) * (board_w / 8))
+        local_y = ((to_rank - 1 + 0.5) * (board_h / 8))
     else:
-        to_x = board_x + ((to_file - 1 + 0.5) * (board_w / 8))
-        to_y = board_y + ((8 - to_rank + 0.5) * (board_h / 8))
-    page.mouse.click(to_x, to_y)
+        local_x = ((to_file - 1 + 0.5) * (board_w / 8))
+        local_y = ((8 - to_rank + 0.5) * (board_h / 8))
+    try:
+        board.click(position={"x": local_x, "y": local_y}, force=True, timeout=800)
+    except Exception:
+        # fallback to absolute page click
+        try:
+            page.mouse.click(board_x + local_x, board_y + local_y)
+        except Exception:
+            pass
 
     # 4) Verify applied robustly
     def _origin_empty() -> bool:
@@ -541,18 +562,137 @@ def _build_arrows_from_top_moves(top_moves: list) -> list:
     return arrows
 
 
+# ================ Subprocess analysis entrypoint =================
+def _analysis_job_entry(job: dict, out_q) -> None:
+    """Child process entrypoint: run analysis and emit progress/result to out_q.
+
+    job keys: html, my_color, think_time, mode, workers, want_click,
+              prevent_overrun, root_early_abort
+    """
+    try:
+        import time as _time
+        from alphabeta import iterative_deepening_search as _ids
+        from simple_multiprocess import get_multiprocess_move as _mp_get
+    # Set engine flags if provided
+        try:
+            import alphabeta as _ab
+            po = job.get('prevent_overrun')
+            rea = job.get('root_early_abort')
+            if po is not None:
+                _ab.OVERFLOW_PREVENTION = bool(po)
+            if rea is not None:
+                _ab.ROOT_EARLY_ABORT = bool(rea)
+        except Exception:
+            pass
+
+        html = job.get('html') or ''
+        my_color = 'b' if str(job.get('my_color') or '').lower().startswith('b') else 'w'
+        think_time = float(job.get('think_time') or THINK_TIME)
+        mode = str(job.get('mode') or 'seq')
+        workers = int(job.get('workers') or 4)
+        want_click = bool(job.get('want_click') or False)
+        try:
+            overrun_budget = float(job.get('overrun_budget')) if job.get('overrun_budget') is not None else 0.6
+        except Exception:
+            overrun_budget = 0.6
+
+        gs = load_state_from_chesscom_html(html, turn=my_color)
+        start_ts = _time.time()
+
+        # Determine actual search mode used (mp vs seq or seq-fallback inside subprocess)
+        mode_used = 'mp' if (mode or '').lower().startswith('mp') else 'seq'
+        try:
+            import multiprocessing as _mp
+            # If we're in a child process and user requested mp, child mp will fallback to seq
+            if (mode_used == 'mp') and getattr(_mp.current_process(), 'name', '') != 'MainProcess':
+                mode_used = 'seq-fallback'
+        except Exception:
+            pass
+
+        def _progress(evt: dict):
+            # Massage values for AI perspective (white positive)
+            e = dict(evt or {})
+            try:
+                bv = e.get('best_val')
+                if isinstance(bv, (int, float)) and my_color == 'b':
+                    e['best_val'] = -float(bv)
+            except Exception:
+                pass
+            # Map top_moves values for label perspective
+            try:
+                tm = e.get('top_moves')
+                if isinstance(tm, list):
+                    mm = []
+                    for it in tm:
+                        try:
+                            v = it.get('val')
+                            if isinstance(v, (int, float)) and my_color == 'b':
+                                v = -float(v)
+                            mm.append({'from': it.get('from'), 'to': it.get('to'), 'val': v})
+                        except Exception:
+                            mm.append(it)
+                    e['top_moves'] = mm
+            except Exception:
+                pass
+            try:
+                out_q.put_nowait({'type': 'progress', 'evt': e, 'cfg': {
+                    'mode': mode, 'mode_used': mode_used, 'think_time': think_time, 'workers': workers, 'my_color': my_color
+                }})
+            except Exception:
+                pass
+
+        try:
+            if (mode or '').lower().startswith('mp'):
+                move, val, nodes, depth = _mp_get(
+                    gs,
+                    think_time,
+                    max(1, int(workers)),
+                    progress=_progress,
+                    top_k=5,
+                    prevent_overrun=bool(job.get('prevent_overrun')) if job.get('prevent_overrun') is not None else True,
+                    root_early_abort=bool(job.get('root_early_abort')) if job.get('root_early_abort') is not None else False,
+                    overrun_budget=overrun_budget,
+                )
+            else:
+                # For SEQ, allow budget extension when overrun prevention is off
+                prevent = bool(job.get('prevent_overrun')) if job.get('prevent_overrun') is not None else True
+                eff_time = float(think_time + (0.0 if prevent else max(0.0, overrun_budget)))
+                val, move, nodes, depth = _ids(gs, max_time=eff_time, start_depth=4, progress=_progress, top_k=5)
+        except Exception as e:
+            try:
+                out_q.put_nowait({'type': 'error', 'error': str(e)})
+            except Exception:
+                pass
+            return
+
+        elapsed = max(0.0, _time.time() - start_ts)
+        try:
+            out_q.put_nowait({'type': 'result', 'move': move, 'val': val, 'nodes': nodes, 'depth': depth, 'elapsed': elapsed, 'cfg': {'my_color': my_color, 'want_click': want_click, 'mode': mode, 'mode_used': mode_used, 'think_time': think_time, 'workers': workers}})
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            out_q.put_nowait({'type': 'error', 'error': str(e)})
+        except Exception:
+            pass
+
 # ================= Background Analysis Worker =================
 class AnalysisWorker:
-    class Cancelled(Exception):
-        pass
+    """Runs AI analysis jobs in a separate process so they can be force-terminated.
+
+    Parent thread receives progress/result via an internal mp.Queue and forwards to UI.
+    """
 
     def __init__(self):
         self._in_q: "queue.Queue[dict]" = queue.Queue()
         self._out_q: "queue.Queue[dict]" = queue.Queue()
         self._thr: Optional[threading.Thread] = None
+        # Thread handle for in-process MP analysis (created in main process)
+        self._job_thr: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._job_guard = threading.Lock()
-        self._cancel_current = threading.Event()
+        self._proc: Optional[mp.Process] = None
+        self._mp_out_q: Optional[mp.Queue] = None
 
     @property
     def out_queue(self):
@@ -567,6 +707,11 @@ class AnalysisWorker:
 
     def stop(self):
         self._stop.set()
+        # Kill any running job process first
+        try:
+            self.kill_current()
+        except Exception:
+            pass
         try:
             self._in_q.put_nowait({'type': 'stop'})
         except Exception:
@@ -577,16 +722,64 @@ class AnalysisWorker:
             except Exception:
                 pass
 
-    def submit(self, html: str, my_color: str, think_time: float, mode: str, workers: int, want_click: bool):
+    def kill_current(self) -> None:
+        """Force-terminate the currently running analysis process (if any)."""
+        # Try process-first
+        proc = self._proc
+        self._proc = None
+        try:
+            if proc is not None and proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            if self._mp_out_q is not None:
+                try:
+                    # Drain quickly to avoid pipe leaks, then close
+                    while True:
+                        _ = self._mp_out_q.get_nowait()
+                except Exception:
+                    pass
+                try:
+                    self._mp_out_q.close()
+                except Exception:
+                    pass
+        finally:
+            self._mp_out_q = None
+        # Then thread job (mp-in-main-process path). We cannot force-kill threads; best-effort cancel.
+        t = self._job_thr
+        self._job_thr = None
+        # Notify UI as cancelled (even if underlying computation finishes later)
+        try:
+            self._out_q.put_nowait({'type': 'cancelled'})
+        except Exception:
+            pass
+
+    def submit(self, html: str, my_color: str, think_time: float, mode: str, workers: int, want_click: bool,
+               prevent_overrun: Optional[bool] = None, root_early_abort: Optional[bool] = None,
+               overrun_budget: Optional[float] = None):
         """Submit a new analysis job, cancelling any previous."""
         with self._job_guard:
-            self._cancel_current.set()  # signal cancel to current job
+            # Force terminate running job (if any) before enqueuing new one
             try:
-                self._in_q.put_nowait({
+                self.kill_current()
+            except Exception:
+                pass
+            try:
+                payload = {
                     'type': 'job', 'html': html, 'my_color': my_color,
                     'think_time': float(think_time), 'mode': str(mode or 'seq'),
-                    'workers': int(max(1, workers or 1)), 'want_click': bool(want_click)
-                })
+                    'workers': int(max(1, workers or 1)), 'want_click': bool(want_click),
+                    'prevent_overrun': bool(prevent_overrun) if prevent_overrun is not None else None,
+                    'root_early_abort': bool(root_early_abort) if root_early_abort is not None else None,
+                }
+                if overrun_budget is not None:
+                    try:
+                        payload['overrun_budget'] = float(overrun_budget)
+                    except Exception:
+                        payload['overrun_budget'] = None
+                self._in_q.put_nowait(payload)
             except Exception:
                 pass
 
@@ -600,88 +793,86 @@ class AnalysisWorker:
                 break
             if item.get('type') != 'job':
                 continue
-            # Prepare job
-            html = item.get('html') or ''
-            my_color = 'b' if str(item.get('my_color') or '').lower().startswith('b') else 'w'
-            think_time = float(item.get('think_time') or THINK_TIME)
-            mode = str(item.get('mode') or 'seq')
-            workers = int(item.get('workers') or 4)
-            want_click = bool(item.get('want_click') or False)
-            # Reset cancel flag for this job
-            self._cancel_current.clear()
+            # Prepare job for subprocess
+            job = {
+                'html': item.get('html') or '',
+                'my_color': 'b' if str(item.get('my_color') or '').lower().startswith('b') else 'w',
+                'think_time': float(item.get('think_time') or THINK_TIME),
+                'mode': str(item.get('mode') or 'seq'),
+                'workers': int(item.get('workers') or 4),
+                'want_click': bool(item.get('want_click') or False),
+                'prevent_overrun': item.get('prevent_overrun'),
+                'root_early_abort': item.get('root_early_abort'),
+                'overrun_budget': item.get('overrun_budget'),
+            }
 
-            gs = load_state_from_chesscom_html(html, turn=my_color)
-            start_ts = time.time()
-            last_best = {'move': None, 'val': None}
-
-            def _progress(evt: dict):
-                if self._cancel_current.is_set():
-                    raise AnalysisWorker.Cancelled()
-                # massage values to AI perspective for display only
-                e = dict(evt or {})
+            # If requested mode is mp, run analysis in a thread so that any
+            # internal process pools are created in the main process.
+            if str(job.get('mode') or '').lower().startswith('mp'):
+                # Stop any previous job
                 try:
-                    bv = e.get('best_val')
-                    if isinstance(bv, (int, float)) and my_color == 'b':
-                        e['best_val'] = -float(bv)
+                    self.kill_current()
                 except Exception:
                     pass
-                # keep last seen best
-                try:
-                    if e.get('best_move'):
-                        last_best['move'] = e.get('best_move')
-                        last_best['val'] = e.get('best_val')
-                except Exception:
-                    pass
-                # map top_moves values for label perspective
-                try:
-                    tm = e.get('top_moves')
-                    if isinstance(tm, list):
-                        mm = []
-                        for it in tm:
-                            try:
-                                v = it.get('val')
-                                if isinstance(v, (int, float)) and my_color == 'b':
-                                    v = -float(v)
-                                mm.append({'from': it.get('from'), 'to': it.get('to'), 'val': v})
-                            except Exception:
-                                mm.append(it)
-                        e['top_moves'] = mm
-                except Exception:
-                    pass
-                try:
-                    self._out_q.put_nowait({'type': 'progress', 'evt': e, 'cfg': {
-                        'mode': mode, 'think_time': think_time, 'workers': workers, 'my_color': my_color
-                    }, 'last_best': dict(last_best)})
-                except Exception:
-                    pass
-
-            # run engine
-            try:
-                if (mode or '').lower().startswith('mp'):
-                    def _mp_progress(evt: dict):
-                        _progress(evt)
-                    move, val, nodes, depth = get_multiprocess_move(gs, think_time, max(1, int(workers)), progress=_mp_progress, top_k=5)
-                else:
-                    val, move, nodes, depth = iterative_deepening_search(gs, max_time=think_time, start_depth=4, progress=_progress, top_k=5)
-            except AnalysisWorker.Cancelled:
-                # cancelled: emit a notice and continue
-                try:
-                    self._out_q.put_nowait({'type': 'cancelled'})
-                except Exception:
-                    pass
+                t = threading.Thread(target=_analysis_job_entry, args=(job, self._out_q), daemon=True)
+                self._job_thr = t
+                t.start()
+                # Wait until the analysis thread finishes or worker is stopped
+                while t.is_alive() and not self._stop.is_set():
+                    time.sleep(0.1)
+                self._job_thr = None
                 continue
-            except Exception as e:
+            else:
+                # Legacy: run in a subprocess for seq mode to allow force-terminate
                 try:
-                    self._out_q.put_nowait({'type': 'error', 'error': str(e)})
+                    self.kill_current()
                 except Exception:
                     pass
-                continue
+                self._mp_out_q = mp.Queue()
+                self._proc = mp.Process(target=_analysis_job_entry, args=(job, self._mp_out_q))
+                self._proc.daemon = True
+                self._proc.start()
 
-            elapsed = max(0.0, time.time() - start_ts)
-            try:
-                self._out_q.put_nowait({'type': 'result', 'move': move, 'val': val, 'nodes': nodes, 'depth': depth, 'elapsed': elapsed, 'cfg': {'my_color': my_color, 'want_click': want_click}})
-            except Exception:
-                pass
+                # Pump messages until process exits and queue is drained
+                proc = self._proc
+                mp_q = self._mp_out_q
+                while proc is not None and proc.is_alive():
+                    if self._stop.is_set():
+                        try:
+                            self.kill_current()
+                        except Exception:
+                            pass
+                        break
+                    try:
+                        ev = mp_q.get(timeout=0.2)
+                        if ev:
+                            self._out_q.put_nowait(ev)
+                            if ev.get('type') in ('result', 'error'):
+                                time.sleep(0.05)
+                                break
+                    except Exception:
+                        pass
+                # Drain any remaining messages
+                try:
+                    while True:
+                        ev = mp_q.get_nowait()
+                        if ev:
+                            self._out_q.put_nowait(ev)
+                except Exception:
+                    pass
+                # Join and cleanup
+                try:
+                    if proc is not None:
+                        proc.join(timeout=0.5)
+                except Exception:
+                    pass
+                try:
+                    if mp_q is not None:
+                        mp_q.close()
+                except Exception:
+                    pass
+                self._proc = None
+                self._mp_out_q = None
 
 
 def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME, mode: str = 'seq', workers: int = 4, show_vectors: bool = True) -> bool:
@@ -725,7 +916,8 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
             used = max(0.0, min(think_time, (think_time - remaining) if remaining is not None else elapsed))
             pct = (used/think_time*100.0) if think_time > 0 else 0.0
 
-            cfg_label = f"mode={mode} | time={think_time:.1f}s" + (f" | workers={workers}" if (mode or '').lower().startswith('mp') else '')
+            used = 'mp' if (mode or '').lower().startswith('mp') else 'seq'
+            cfg_label = f"mode={mode} | used={used} | time={think_time:.1f}s" + (f" | workers={workers}" if (mode or '').lower().startswith('mp') else '')
             parts = [f"depth={depth}", f"elapsed={elapsed:.2f}s", f"nodes={nodes_total}", f"nps={nps:.0f}"]
             lines = [f"<div><b>AI</b> <span style='opacity:.85'>{cfg_label}</span></div>", f"<div>{' | '.join(parts)}</div>"]
             if best_move:
@@ -798,6 +990,18 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
 
     if (mode or '').lower().startswith('mp'):
         try:
+            cfg_cur = {}
+            try:
+                cfg_cur = _get_cfg(page) or {}
+            except Exception:
+                cfg_cur = {}
+            prevent_overrun_flag = bool(cfg_cur.get('preventOverrun') if cfg_cur.get('preventOverrun') is not None else True)
+            root_early_abort_flag = bool(cfg_cur.get('rootEarlyAbort') if cfg_cur.get('rootEarlyAbort') is not None else False)
+            # Fetch overrun budget from overlay config (fallback to 0.6)
+            try:
+                overrun_budget_val = float(cfg_cur.get('overrunBudget')) if cfg_cur.get('overrunBudget') is not None else 0.6
+            except Exception:
+                overrun_budget_val = 0.6
             def _mp_progress(evt: dict):
                 try:
                     _progress(evt)
@@ -805,7 +1009,16 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
                     raise
                 except Exception:
                     pass
-            move, val, nodes, depth = get_multiprocess_move(gs, think_time, max(1, int(workers or 1)), progress=_mp_progress, top_k=5)
+            move, val, nodes, depth = get_multiprocess_move(
+                gs,
+                think_time,
+                max(1, int(workers or 1)),
+                progress=_mp_progress,
+                top_k=5,
+                prevent_overrun=prevent_overrun_flag,
+                root_early_abort=root_early_abort_flag,
+                overrun_budget=overrun_budget_val,
+            )
         except _Cancelled:
             print("[AI] 취소됨(Halt)")
             _force_halt_reset(page)
@@ -872,8 +1085,10 @@ def make_ai_move(page, html: str, my_color: str, think_time: float = THINK_TIME,
     print(f"AI Move: engine {eng_from}->{eng_to} | ui {from_sq}->{to_sq} (val={disp_val}, nodes={nodes}, depth={depth})")
     try:
         nps_done = (nodes/elapsed) if elapsed > 0 else 0.0
+        used = 'mp' if (mode or '').lower().startswith('mp') else 'seq'
         final_lines = [
             "<div><b>AI</b> <span style='opacity:.85'>done</span></div>",
+            f"<div>mode={mode} | used={used} | time={think_time:.1f}s" + (f" | workers={workers}" if (mode or '').lower().startswith('mp') else '') + "</div>",
             f"<div>depth={depth} | elapsed={elapsed:.2f}s | nodes={nodes} | nps={nps_done:.0f}</div>",
             f"<div>pv={from_sq}->{to_sq}</div>",
             f"<div>eval={disp_val}</div>",
@@ -936,73 +1151,6 @@ def _navigate_with_fallback(page, url: str, alt_url: Optional[str] = None) -> No
         page.wait_for_load_state('load', timeout=10000)
     except Exception:
         pass
-
-
-def _wait_for_board_change(page, last_fen: str, my_color: str, timeout_s: float = 120.0, poll_s: float = 0.5) -> Tuple[str, str]:
-    """Wait for a stable board change. Expect an opponent move:
-    - Opponent piece-count should remain the same (or increase only in promotions, which we'll treat as same for count),
-    - My piece-count should be either same (quiet) or -1 (if my piece was captured).
-    The new FEN must be different and stable across two samples.
-    """
-    def _cnt_side(f: str, is_white: bool) -> int:
-        return sum(1 for ch in f if (ch.isupper() if is_white else ch.islower()))
-
-    opp_is_white = (str(my_color).lower().startswith('b'))
-    me_is_white = not opp_is_white
-    last_cnt_opp = _cnt_side(last_fen, opp_is_white)
-    last_cnt_me = _cnt_side(last_fen, me_is_white)
-    deadline = time.time() + timeout_s
-    last_stable = None  # track last stable pair for fallback
-    stable_repeats = 0
-    while time.time() < deadline:
-        if _overlay_is_halt(page):
-            _force_halt_reset(page)
-            raise TimeoutError("halted")
-        html1 = _get_current_html(page)
-        fen1 = parse_chesscom_html_to_fen(html1)
-        if fen1 != last_fen:
-            # debounce/stability check
-            time.sleep(min(0.2, max(0.1, poll_s/2)))
-            html2 = _get_current_html(page)
-            fen2 = parse_chesscom_html_to_fen(html2)
-            if fen2 == fen1:
-                # track stability
-                if last_stable == fen2:
-                    stable_repeats += 1
-                else:
-                    last_stable = fen2
-                    stable_repeats = 1
-                try:
-                    cnt2_opp = _cnt_side(fen2, opp_is_white)
-                    cnt2_me = _cnt_side(fen2, me_is_white)
-                    ok_counts = (cnt2_opp == last_cnt_opp) and (cnt2_me in (last_cnt_me, last_cnt_me - 1))
-                    # Very conservative check: ensure the board diff looks like an opponent move
-                    ok_plausible = _plausible_opponent_move(last_fen, fen2, my_color)
-                    if ok_counts and ok_plausible:
-                        # micro grace: absorb rapid consecutive updates (animations/instant reply)
-                        micro_deadline = time.time() + min(0.25, max(0.1, poll_s))
-                        latest_html, latest_fen = html2, fen2
-                        while time.time() < micro_deadline:
-                            html3 = _get_current_html(page)
-                            fen3 = parse_chesscom_html_to_fen(html3)
-                            if fen3 != latest_fen:
-                                # restart confirmation for the new change
-                                time.sleep(min(0.2, max(0.08, poll_s/2)))
-                                html4 = _get_current_html(page)
-                                fen4 = parse_chesscom_html_to_fen(html4)
-                                if fen4 == fen3:
-                                    latest_html, latest_fen = html4, fen4
-                                    continue
-                            time.sleep(min(0.12, max(0.06, poll_s/3)))
-                        return latest_html, latest_fen
-                    # strong stability fallback: if counts rule fails but we've seen >=3 repeats, accept
-                    if stable_repeats >= 3 and ok_plausible:
-                        return html2, fen2
-                except Exception:
-                    # If counting fails, still accept stable change
-                    return html2, fen2
-        time.sleep(poll_s)
-    raise TimeoutError("board change wait timeout")
 
 
 def _get_cfg(page) -> dict:
@@ -1075,7 +1223,7 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
                 print("[auto] 게임 종료 감지됨: Halt")
                 _overlay_set_halt(page)
                 try:
-                    _vector_clear(page)
+                    worker.kill_current()
                 except Exception:
                     pass
         except Exception:
@@ -1096,6 +1244,8 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
         workers = int(cfg.get('workers') or 4)
         show_vectors = bool(cfg.get('showVectors') if cfg.get('showVectors') is not None else True)
         show_pieces = bool(cfg.get('showPieces') if cfg.get('showPieces') is not None else False)
+        prevent_overrun = bool(cfg.get('preventOverrun') if cfg.get('preventOverrun') is not None else True)
+        root_early_abort = bool(cfg.get('rootEarlyAbort') if cfg.get('rootEarlyAbort') is not None else False)
         think_once = bool(cfg.get('thinkOnce') or False)
         auto_detect_on = bool(cfg.get('autoDetect') or False)
         # 루프마다 myColor 최신값 사용
@@ -1108,7 +1258,22 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
             if think_once or auto_detect_on:
                 _overlay_clear_halt_keep_cfg(page)
             else:
-                _force_halt_reset(page)
+                # Force-stop running analysis only; keep UI as-is
+                try:
+                    worker.kill_current()
+                except Exception:
+                    pass
+                # Immediately mark UI as halted and clear vectors
+                try:
+                    _overlay_append_halted_once(page)
+                except Exception:
+                    pass
+                # Drain any pending events to avoid stale overlays later
+                try:
+                    while True:
+                        _ = out_q.get_nowait()
+                except Exception:
+                    pass
                 time.sleep(poll_s_idle)
                 continue
 
@@ -1123,11 +1288,32 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
                     _squares_set(page, parse_chesscom_html_to_piece_markers(html_now))
             except Exception:
                 pass
-            worker.submit(html_now, my_color, cur_time, mode, workers, want_click=True)
+            # Immediately show starting status to override any previous overlay
+            try:
+                cfg_label = f"mode={mode} | time={cur_time:.1f}s" + (f" | workers={workers}" if (mode or '').lower().startswith('mp') else '')
+                _overlay_set(page, f"<div><b>AI</b> <span style='opacity:.85'>{cfg_label}</span></div><div>starting…</div>")
+                if show_vectors:
+                    _vector_clear(page)
+            except Exception:
+                pass
+            # 엔진에 과도초과 방지 옵션 전달은 글로벌/모듈 플래그로 처리
+            try:
+                import alphabeta as _ab
+                _ab.OVERFLOW_PREVENTION = bool(prevent_overrun)
+                _ab.ROOT_EARLY_ABORT = bool(root_early_abort)
+            except Exception:
+                pass
+            # Pull overrunBudget from overlay config
+            try:
+                overrun_budget = float(cfg.get('overrunBudget')) if cfg.get('overrunBudget') is not None else 0.6
+            except Exception:
+                overrun_budget = 0.6
+            worker.submit(
+                html_now, my_color, cur_time, mode, workers, want_click=True,
+                prevent_overrun=prevent_overrun, root_early_abort=root_early_abort,
+                overrun_budget=overrun_budget,
+            )
             active_job = True
-            active_want_click = True
-            # 진행은 out_queue 이벤트로 처리
-            # 계속 루프 진행
 
         try:
             html_now = _get_current_html(page)
@@ -1165,7 +1351,29 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
                                     _squares_set(page, parse_chesscom_html_to_piece_markers(html_conf))
                             except Exception:
                                 pass
-                            worker.submit(html_conf, my_color, cur_time, mode, workers, want_click=True)
+                            # Immediately show starting status to override any previous overlay
+                            try:
+                                cfg_label = f"mode={mode} | time={cur_time:.1f}s" + (f" | workers={workers}" if (mode or '').lower().startswith('mp') else '')
+                                _overlay_set(page, f"<div><b>AI</b> <span style='opacity:.85'>{cfg_label}</span></div><div>starting…</div>")
+                                if show_vectors:
+                                    _vector_clear(page)
+                            except Exception:
+                                pass
+                            # 엔진 플래그 업데이트
+                            try:
+                                import alphabeta as _ab
+                                _ab.OVERFLOW_PREVENTION = bool(prevent_overrun)
+                                _ab.ROOT_EARLY_ABORT = bool(root_early_abort)
+                            except Exception:
+                                pass
+                            # overrun budget from UI for auto-detect path
+                            try:
+                                overrun_budget = float(cfg.get('overrunBudget')) if cfg.get('overrunBudget') is not None else 0.6
+                            except Exception:
+                                overrun_budget = 0.6
+                            worker.submit(html_conf, my_color, cur_time, mode, workers, want_click=True,
+                                           prevent_overrun=prevent_overrun, root_early_abort=root_early_abort,
+                                           overrun_budget=overrun_budget)
                             active_job = True
                             active_want_click = True
                 else:
@@ -1194,7 +1402,8 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
                         workers_v = int(cfg_view.get('workers') or 4)
                         myc = str(cfg_view.get('my_color') or my_color)
                         used = min(think_t, elapsed); pct = (used/think_t*100.0) if think_t>0 else 0.0
-                        cfg_label = f"mode={mode_v} | time={think_t:.1f}s" + (f" | workers={workers_v}" if mode_v.lower().startswith('mp') else '')
+                        used_v = str(cfg_view.get('mode_used') or ('mp' if mode_v.lower().startswith('mp') else 'seq'))
+                        cfg_label = f"mode={mode_v} | used={used_v} | time={think_t:.1f}s" + (f" | workers={workers_v}" if mode_v.lower().startswith('mp') else '')
                         parts = [f"depth={depth}", f"elapsed={elapsed:.2f}s", f"nodes={nodes_total}", f"nps={nps:.0f}"]
                         lines = [f"<div><b>AI</b> <span style='opacity:.85'>{cfg_label}</span></div>", f"<div>{' | '.join(parts)}</div>"]
                         if best_move:
@@ -1207,8 +1416,8 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
                                    f"<div style='height:100%;width:{pct:.1f}%;background:#4CAF50;'></div></div>")
                             lines.append(bar)
                         _overlay_set(page, ''.join(lines))
-                        if show_vectors:
-                            _vector_set(page, _build_arrows_from_top_moves(tm or []))
+                        if show_vectors and isinstance(tm, list) and len(tm) > 0:
+                            _vector_set(page, _build_arrows_from_top_moves(tm))
                     except Exception:
                         pass
                 elif et == 'result':
@@ -1222,13 +1431,22 @@ def auto_play_loop(page, my_color: str, think_time: float = THINK_TIME, mode: st
                         if res_move:
                             fr_ui = _rc_to_ui_algebraic(res_move[0]); to_ui = _rc_to_ui_algebraic(res_move[1])
                             disp_val = -val if (cfg_res.get('my_color') == 'b' and isinstance(val, (int, float))) else val
+                            mode_v = str(cfg_res.get('mode') or 'seq'); used_v = str(cfg_res.get('mode_used') or ('mp' if mode_v.lower().startswith('mp') else 'seq'))
                             final_lines = [
                                 "<div><b>AI</b> <span style='opacity:.85'>done</span></div>",
+                                f"<div>mode={mode_v} | used={used_v} | time={float(cfg_res.get('think_time') or THINK_TIME):.1f}s" + (f" | workers={int(cfg_res.get('workers') or 4)}" if mode_v.lower().startswith('mp') else '') + "</div>",
                                 f"<div>depth={depth} | elapsed={elapsed:.2f}s | nodes={nodes} | nps={nps_done:.0f}</div>",
                                 f"<div>pv={fr_ui}->{to_ui}</div>",
                                 f"<div>eval={disp_val}</div>",
                             ]
                             _overlay_set(page, ''.join(final_lines))
+                            try:
+                                if show_vectors:
+                                    _vector_set(page, _build_arrows_from_top_moves([
+                                        {'from': res_move[0], 'to': res_move[1], 'val': disp_val if isinstance(disp_val, (int, float)) else 0.0}
+                                    ]))
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                     # Optional click without waiting for reflection
@@ -1251,7 +1469,7 @@ def main():
     URL = "https://www.chess.com/ko/play/computer"
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
-        context = browser.new_context(viewport={"width": 1000, "height": 720})
+        context = browser.new_context(viewport={"width": 1100, "height": 720})
         try:
             # Register init assets at context-level before creating any pages
             _register_init_assets(context)
